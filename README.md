@@ -101,7 +101,7 @@ autofix run THER-203
 | Jira base URL | `https://your-team.atlassian.net` |
 | Atlassian email | `you@company.com` |
 | **API token** | create at https://id.atlassian.com/manage-profile/security/api-tokens → **"Create API token with scopes"** → select **Jira + Bitbucket** → read/write repository & pull requests |
-| Bitbucket workspace | `lookme` |
+| Bitbucket workspace | `AutoBotDraft` |
 | Git push username | the username your existing Bitbucket HTTPS remote uses |
 | Base branch | `develop` (or `main`) |
 
