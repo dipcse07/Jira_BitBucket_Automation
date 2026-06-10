@@ -38,7 +38,7 @@ it to *In Progress*.
 A single CLI, `autofix` (plus the `autoBotDraft` watcher alias), that turns a Jira ticket
 into a reviewable draft PR with zero manual coding for well-scoped changes.
 
-- **One ticket:** `autofix run THER-203`
+- **One ticket:** `autofix run [Ticket Titel]`
 - **Every eligible ticket once:** `autofix run-all`
 - **Forever, every N minutes:** `autoBotDraft 5` (foreground) or `autofix install-daemon` (background, survives reboot)
 
