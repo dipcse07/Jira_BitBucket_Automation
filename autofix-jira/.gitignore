@@ -1,0 +1,4 @@
+config.env
+runs/
+workspaces/
+*.log
