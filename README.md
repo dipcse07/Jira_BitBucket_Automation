@@ -84,14 +84,14 @@ cd Jira_BitBucket_Automation/autofix-jira
 ./install.sh
 
 # 3. Map your Jira project key → Bitbucket repo slug
-autofix map THER=thermometer_ios
+autofix map PROJECT=ProjectName
 
 # 4. Verify everything is wired up
 autofix doctor
 
 # 5. List your AI-eligible tickets, then resolve one end-to-end
 autofix list
-autofix run THER-203
+autofix run Ticket Titel
 ```
 
 ### What the setup wizard asks for
@@ -113,7 +113,7 @@ Config is saved to `~/.config/autofix-jira/config.env` (`chmod 600`). **Never co
 autofix doctor                      # verify deps + credentials
 autofix map THER=thermometer_ios    # map a Jira project key -> Bitbucket repo slug
 autofix list                        # AI-eligible tickets assigned to you
-autofix run THER-203                # resolve one ticket -> draft PR
+autofix run Ticket Titel                # resolve one ticket -> draft PR
 autofix run-all                     # process every eligible ticket once
 autofix status                      # show daemon / config state
 autofix logs -f                     # follow the run log
