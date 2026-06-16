@@ -30,18 +30,28 @@ cd autofix-jira
 ./install.sh
 ```
 
-The installer checks dependencies, links `autofix` onto your `PATH` (`~/.local/bin/autofix`),
-and runs the configuration wizard.
+`./install.sh` runs **one continuous guided setup** (`autofix quickstart`): it checks
+dependencies, links `autofix`/`autoBotDraft` onto your `PATH` (`~/.local/bin`), collects both API
+tokens, maps your Jira projects to repos, verifies Jira **and** Bitbucket auth, optionally
+registers an auto-start-at-login watcher, and can start watching immediately — all in one flow.
+
+Re-run the whole guided setup anytime with `autofix quickstart`. The individual steps
+(`setup`, `map`, `doctor`, `list`, `run`) are still available if you prefer to do it piecemeal.
 
 ### What setup asks for
 | Prompt | Example |
 |---|---|
 | Jira base URL | `https://your-team.atlassian.net` |
 | Atlassian email | `you@company.com` |
-| **API token** | create at https://id.atlassian.com/manage-profile/security/api-tokens → **"Create API token with scopes"** → select **Jira + Bitbucket** → read/write repository & pull requests |
-| Bitbucket workspace | `lookme` |
+| **Jira API token** | create at https://id.atlassian.com/manage-profile/security/api-tokens → **"Create API token with scopes"** → app **Jira** → scopes `read:jira-user`, `read:jira-work`, `write:jira-work` (a plain unscoped token also works for Jira) |
+| **Bitbucket API token** | a **second** token → **"Create API token with scopes"** → app **Bitbucket** → scopes `read:account`, `read:workspace:bitbucket`, `read:repository:bitbucket`, `write:repository:bitbucket`, `read:pullrequest:bitbucket`, `write:pullrequest:bitbucket` |
+| Bitbucket workspace | `your-workspace` |
 | Git push username | the username your existing Bitbucket HTTPS remote uses |
 | Base branch | `develop` (or `main`) |
+
+> **Why two tokens?** Atlassian API tokens are per-product — a single token can't
+> hold both Jira and Bitbucket scopes — so you create one for each. (Bitbucket app
+> passwords were retired June 9, 2026, so a scoped API token is now the only option.)
 
 Config is saved to `~/.config/autofix-jira/config.env` (`chmod 600`). **Never commit it.**
 
@@ -49,15 +59,24 @@ Config is saved to `~/.config/autofix-jira/config.env` (`chmod 600`). **Never co
 
 ```bash
 autofix doctor                      # verify deps + credentials
-autofix map THER=thermometer_ios    # map a Jira project key -> Bitbucket repo slug
+autofix map PROJ=my-repo            # map a Jira project key -> Bitbucket repo slug
 autofix list                        # AI-eligible tickets assigned to you
-autofix run THER-203                # resolve one ticket -> draft PR
+autofix run PROJ-123                # resolve one ticket -> draft PR
 autofix run-all                     # process every eligible ticket once
-autofix run-all --watch 5           # daemon: re-check & process every 5 minutes
+autofix run-all --watch 5           # foreground loop: re-check & process every 5 minutes
+autofix install-daemon 5            # headless background job (launchd/cron), survives reboot
+autofix install-login 5             # macOS: auto-open a Terminal at login, foreground watcher inside
 ```
 
 `run-all` skips any ticket whose Jira project isn't in `REPO_MAP` (prints how to map it) and
 isolates failures, so one bad ticket never stops the batch.
+
+**Auto-start at login (macOS).** `autofix install-login [MIN]` registers a Login Item that opens
+a visible Terminal window at every login and runs the foreground watcher in it. Since it runs in
+the foreground, **closing the window or pressing Ctrl-C stops it** — and it re-opens at the next
+login. Remove it with `autofix uninstall-login`. Start it now without rebooting:
+`open ~/.config/autofix-jira/AutoBotDraft.command`. (For a windowless background service that runs
+regardless of login, use `install-daemon` instead.)
 
 **Eligibility** (the `list` filter, configurable in `config.env`):
 > assigned to **you** (`currentUser()`) **AND** not Done **AND** ( has a label in `AI_LABELS` **OR** summary/description matches `AI_TEXT` )
@@ -91,7 +110,9 @@ Every run logs prompt, ticket JSON, diff, Claude output, and push/PR results to
 | Key | Meaning |
 |---|---|
 | `JIRA_BASE_URL` | Your Jira Cloud base URL |
-| `JIRA_EMAIL` / `JIRA_API_TOKEN` | Atlassian Basic-auth credentials (used for Jira **and** Bitbucket REST) |
+| `JIRA_EMAIL` | Atlassian account email (Basic-auth username for both Jira and Bitbucket) |
+| `JIRA_API_TOKEN` | Jira-scoped (or unscoped) API token — used for Jira REST |
+| `BITBUCKET_API_TOKEN` | Bitbucket-scoped API token — used for Bitbucket REST (draft PR). Falls back to `JIRA_API_TOKEN` if unset, but that will 401 unless the Jira token happens to carry Bitbucket scopes |
 | `BITBUCKET_WORKSPACE` | Bitbucket workspace key |
 | `BITBUCKET_GIT_USER` | Username pinned into the HTTPS git remote for clone/push |
 | `BASE_BRANCH` | Branch to base work on and target the PR at (default `develop`) |
@@ -103,11 +124,13 @@ Every run logs prompt, ticket JSON, diff, Claude output, and push/PR results to
 
 - **Clone/push fails:** the tool uses your existing git credential helper. Run a manual
   `git clone https://<user>@bitbucket.org/<workspace>/<repo>.git` once to confirm/store creds.
-  Bitbucket app passwords are retired — use a repository/workspace **Access Token** or API token
-  configured in your credential helper.
-- **PR API returns 401/404:** your API token lacks Bitbucket pull-request scopes, or the
-  Basic-auth username must be your **email** (not the Bitbucket username). The branch is still
-  pushed; open the PR manually.
+  Bitbucket app passwords were retired June 9, 2026 — use a scoped **API token** (or a
+  repository/workspace **Access Token**) in your credential helper.
+- **PR API returns 401/404 / `autofix run` fails at the PR step:** your `BITBUCKET_API_TOKEN`
+  is missing Bitbucket scopes or is the wrong token. Remember Jira and Bitbucket need **separate**
+  tokens — a Jira (or unscoped) token will 401 against Bitbucket. Re-run `autofix setup` with a
+  Bitbucket-app token that has `read/write:pullrequest:bitbucket`. The Basic-auth username must be
+  your **email**. Run `autofix doctor` to confirm both Jira and Bitbucket auth pass.
 - **`autofix: command not found`:** add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
 ## Security notes

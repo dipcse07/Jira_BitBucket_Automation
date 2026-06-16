@@ -39,8 +39,8 @@ case ":$PATH:" in
      c 33 "    export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-# 3. run configuration wizard
-c 36 "Launching configuration..."
-"$SCRIPT" setup
+# 3. run the complete guided setup (config → map → verify → auto-start → watch)
+c 36 "Launching guided setup..."
+"$SCRIPT" quickstart
 
-c 32 "✓ Installed. Try:  autofix list"
+c 32 "✓ Done. Re-run anytime with:  autofix quickstart   (or 'autofix doctor' to re-verify)"

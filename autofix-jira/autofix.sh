@@ -14,7 +14,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 AUTOFIX_HOME="${AUTOFIX_HOME:-$HOME/.config/autofix-jira}"
 CONFIG_FILE="$AUTOFIX_HOME/config.env"
 RUNS_DIR="$AUTOFIX_HOME/runs"
@@ -24,8 +24,21 @@ DAEMON_LABEL="com.autofix-jira.daemon"
 DAEMON_PLIST="$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"
 RUNALL_LOCK="$AUTOFIX_HOME/run-all.lock"
 SHELLRC="$AUTOFIX_HOME/shellrc.sh"
-# Absolute path to this script (resolved even when invoked via the PATH symlink)
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# Login-item launcher: opens a visible Terminal at login and runs the foreground watcher.
+LOGIN_CMD="$AUTOFIX_HOME/AutoBotDraft.command"
+LOGIN_ITEM_NAME="AutoBotDraft"
+# Absolute path to the REAL script, following symlinks (macOS readlink lacks -f).
+# Must resolve the symlink so we never relink a PATH symlink to point at itself.
+_resolve_self() {
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd "$(dirname "$p")" 2>/dev/null && pwd)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  printf '%s' "$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p")"
+}
+SELF="$(_resolve_self "${BASH_SOURCE[0]}")"
 
 # ---------- pretty output ----------
 _c() { printf '\033[%sm%s\033[0m' "$1" "$2"; }
@@ -46,6 +59,10 @@ load_config() {
   AI_LABELS="${AI_LABELS:-AI,ai-task,auto-fix,ai-fix}"
   AI_TEXT="${AI_TEXT:-ai}"
   BITBUCKET_GIT_USER="${BITBUCKET_GIT_USER:-$JIRA_EMAIL}"
+  # Bitbucket REST needs its own single-app scoped token (Atlassian tokens are
+  # per-product; one token can't carry both Jira and Bitbucket scopes). Fall back
+  # to the Jira token for backward compatibility with older configs.
+  BITBUCKET_API_TOKEN="${BITBUCKET_API_TOKEN:-$JIRA_API_TOKEN}"
   REPO_MAP="${REPO_MAP:-}"
 }
 
@@ -65,19 +82,46 @@ jira() { # jira METHOD PATH [data]
   curl "${args[@]}"
 }
 jira_search() { # jira_search JQL  -> issues json
+  # Uses the current endpoint /rest/api/3/search/jql. The old /rest/api/2/search
+  # (and /rest/api/3/search) were deprecated May 2025 and removed (HTTP 410) by late
+  # 2025, so this MUST target /search/jql. Response still exposes .issues[].
   local jql; jql="$(jq -rn --arg x "$1" '$x|@uri')"
-  jira GET "/search?jql=$jql&maxResults=50&fields=summary,status,assignee,labels,updated"
+  curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" -H "Accept: application/json" \
+    "$JIRA_BASE_URL/rest/api/3/search/jql?jql=$jql&maxResults=50&fields=summary,status,assignee,labels,updated"
 }
 
 # ---------- bitbucket REST ----------
 bb() { # bb METHOD PATH [data]
   local method="$1" path="$2" data="${3:-}"
-  local args=(-sS -w '\n__HTTP__%{http_code}' -u "$JIRA_EMAIL:$JIRA_API_TOKEN" -H "Accept: application/json" -X "$method" "https://api.bitbucket.org/2.0$path")
+  local args=(-sS -w '\n__HTTP__%{http_code}' -u "$JIRA_EMAIL:$BITBUCKET_API_TOKEN" -H "Accept: application/json" -X "$method" "https://api.bitbucket.org/2.0$path")
   [ -n "$data" ] && args+=(-H "Content-Type: application/json" -d "$data")
   curl "${args[@]}"
 }
 http_code() { printf '%s' "$1" | sed -n 's/.*__HTTP__//p'; }
 http_body() { printf '%s' "$1" | sed 's/__HTTP__[0-9]*$//'; }
+
+# ---------- git over HTTPS to Bitbucket ----------
+# Percent-encode a string for safe use in a URL userinfo field (so an email's '@'
+# and a token's '=', '+', '/' don't corrupt the URL).
+urlenc() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+# git with interactive prompts disabled (auth comes from the credentialed remote URL).
+git_bb() { GIT_TERMINAL_PROMPT=0 git "$@"; }
+# Build the authenticated Bitbucket remote URL. NOTE: git over HTTPS with an Atlassian
+# API token requires the STATIC username `x-bitbucket-api-token-auth` (the email works
+# for the REST API but NOT for git). App passwords are gone (June 2026), so the API
+# token is the way. The token is URL-encoded; the static username needs no encoding.
+bb_remote() { printf 'https://x-bitbucket-api-token-auth:%s@bitbucket.org/%s/%s.git' \
+  "$(urlenc "$BITBUCKET_API_TOKEN")" "$BITBUCKET_WORKSPACE" "$1"; }
 
 # ---------- repo mapping ----------
 resolve_repo() { # resolve_repo JIRA_PROJECT_KEY -> repo slug (or empty)
@@ -96,13 +140,29 @@ resolve_repo() { # resolve_repo JIRA_PROJECT_KEY -> repo slug (or empty)
 # =======================================================================
 cmd_setup() {
   hr; info "autofix-jira setup (v$VERSION)"; hr
-  local base email token ws gituser baseb
+  # Load any existing config so we can pre-fill prompts AND preserve settings that
+  # setup doesn't ask about (REPO_MAP, AI_LABELS, AI_TEXT) instead of wiping them.
+  [ -f "$CONFIG_FILE" ] && { set -a; # shellcheck disable=SC1090
+    . "$CONFIG_FILE"; set +a; }
+  local base email token bbtoken ws gituser baseb
   prompt_value base  "Jira base URL (e.g. https://your-team.atlassian.net)" "${JIRA_BASE_URL:-}"
   prompt_value email "Atlassian account email" "${JIRA_EMAIL:-}"
-  echo "Create a scoped API token at: https://id.atlassian.com/manage-profile/security/api-tokens"
-  echo "  -> 'Create API token with scopes' -> select Jira + Bitbucket -> read/write repository & pull requests."
-  prompt_secret token "Atlassian API token (hidden)"
-  prompt_value ws    "Bitbucket workspace key (e.g. lookme)" "${BITBUCKET_WORKSPACE:-}"
+  echo
+  echo "Atlassian API tokens are per-product — one token CANNOT hold both Jira and"
+  echo "Bitbucket scopes — so you need TWO tokens. Create both at:"
+  echo "  https://id.atlassian.com/manage-profile/security/api-tokens"
+  echo
+  echo "  1) JIRA token:  'Create API token with scopes' -> app 'Jira' -> scopes:"
+  echo "       read:jira-user, read:jira-work, write:jira-work"
+  echo "     (an unscoped 'Create API token' also works for Jira)"
+  echo "  2) BITBUCKET token: 'Create API token with scopes' -> app 'Bitbucket' -> scopes:"
+  echo "       read:account, read:workspace:bitbucket,"
+  echo "       read:repository:bitbucket, write:repository:bitbucket,"
+  echo "       read:pullrequest:bitbucket, write:pullrequest:bitbucket"
+  echo
+  prompt_secret token   "Jira API token (hidden)"
+  prompt_secret bbtoken "Bitbucket API token (hidden)"
+  prompt_value ws    "Bitbucket workspace key (e.g. my-workspace)" "${BITBUCKET_WORKSPACE:-}"
   prompt_value gituser "Bitbucket git push username (for the HTTPS remote)" "${BITBUCKET_GIT_USER:-$email}"
   prompt_value baseb "Default base branch to branch off / target" "${BASE_BRANCH:-develop}"
 
@@ -110,11 +170,18 @@ cmd_setup() {
   local who; who="$(curl -sS -u "$email:$token" "$base/rest/api/2/myself" || true)"
   echo "$who" | jq -e '.accountId' >/dev/null 2>&1 \
     && ok "Jira OK — authenticated as $(echo "$who" | jq -r '.displayName')" \
-    || die "Jira auth failed. Check email / token / scopes."
+    || die "Jira auth failed. Check the Jira email / token / scopes (needs read:jira-user)."
 
   info "Validating Bitbucket access to workspace '$ws'..."
-  local bbcode; bbcode="$(curl -sS -o /dev/null -w '%{http_code}' -u "$email:$token" "https://api.bitbucket.org/2.0/workspaces/$ws" || true)"
-  [ "$bbcode" = "200" ] && ok "Bitbucket OK (workspace reachable)" || warn "Bitbucket workspace check returned HTTP $bbcode (token may lack Bitbucket scopes; git push uses your local git credentials regardless)."
+  local bbcode; bbcode="$(curl -sS -o /dev/null -w '%{http_code}' -u "$email:$bbtoken" "https://api.bitbucket.org/2.0/workspaces/$ws" || true)"
+  if [ "$bbcode" = "200" ]; then
+    ok "Bitbucket OK (workspace reachable)"
+  else
+    err "Bitbucket auth failed (HTTP $bbcode). The DRAFT-PR step ('autofix run') WILL fail until this is fixed."
+    err "Your Bitbucket token is missing scopes or is the wrong token. It needs a Bitbucket-app"
+    err "token with: read:account, read/write:repository:bitbucket, read/write:pullrequest:bitbucket."
+    err "Note: a Jira token (or unscoped token) does NOT work for Bitbucket. Re-run 'autofix setup' with a Bitbucket token."
+  fi
 
   mkdir -p "$AUTOFIX_HOME"
   umask 177
@@ -123,19 +190,122 @@ cmd_setup() {
 JIRA_BASE_URL="$base"
 JIRA_EMAIL="$email"
 JIRA_API_TOKEN="$token"
+BITBUCKET_API_TOKEN="$bbtoken"
 BITBUCKET_WORKSPACE="$ws"
 BITBUCKET_GIT_USER="$gituser"
 BASE_BRANCH="$baseb"
 # Eligibility: ticket assigned to you AND (has one of these labels OR text matches AI_TEXT)
-AI_LABELS="AI,ai-task,auto-fix,ai-fix"
-AI_TEXT="ai"
-# Jira project key -> Bitbucket repo slug, comma-separated. e.g. THER=thermometer_ios,PROJ=yoursmile
+AI_LABELS="${AI_LABELS:-AI,ai-task,auto-fix,ai-fix}"
+AI_TEXT="${AI_TEXT:-ai}"
+# Jira project key -> Bitbucket repo slug, comma-separated. e.g. PROJ=my-repo,PROJ2=my-other-repo
 REPO_MAP="${REPO_MAP:-}"
 EOF
   chmod 600 "$CONFIG_FILE"
   hr; ok "Saved $CONFIG_FILE"
-  info "Next: map your Jira projects to repos, e.g.  $0 map THER=thermometer_ios"
+  info "Next: map your Jira projects to repos, e.g.  $0 map PROJ=my-repo"
   info "Then:  $0 list   and   $0 run <TICKET-KEY>"
+}
+
+# =======================================================================
+# quickstart — one continuous, guided setup: deps → PATH → config →
+# project mapping → verify → (optional) auto-start at login → watch now.
+# =======================================================================
+ensure_symlinks() {
+  local bin="${BIN_DIR:-$HOME/.local/bin}"
+  mkdir -p "$bin"
+  chmod +x "$SELF" 2>/dev/null || true
+  local name link
+  for name in autofix autoBotDraft; do
+    link="$bin/$name"
+    # Never link a symlink to itself (would create a loop). Skip if SELF *is* this link.
+    if [ "$SELF" = "$link" ]; then
+      warn "Skipping $link — could not resolve the real script path. Re-run via the real autofix.sh."
+      continue
+    fi
+    ln -sf "$SELF" "$link"
+  done
+  ok "Linked 'autofix' and 'autoBotDraft' into $bin → $SELF"
+  case ":$PATH:" in
+    *":$bin:"*) : ;;
+    *) warn "$bin is not on your PATH. Add this to your shell profile, then reopen the terminal:"
+       printf '      export PATH="%s:$PATH"\n' "$bin" ;;
+  esac
+}
+
+ask_yes_no() { # ask_yes_no "Question" default(y/n) -> returns 0 for yes
+  local q="$1" def="${2:-y}" ans hint
+  case "$def" in y) hint="Y/n" ;; *) hint="y/N" ;; esac
+  read -r -p "$q [$hint]: " ans; ans="${ans:-$def}"
+  case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_quickstart() {
+  hr; info "autofix-jira — complete guided setup (v$VERSION)"; hr
+  info "This walks you through everything in one go: tools → credentials → repo mapping → verify → auto-start."
+  echo
+
+  # 1. Dependencies
+  info "Step 1/6 — checking dependencies..."
+  local miss=0
+  for d in git curl jq; do command -v "$d" >/dev/null 2>&1 && ok "found $d" || { err "missing: $d"; miss=1; }; done
+  if command -v claude >/dev/null 2>&1; then ok "found claude (Claude Code CLI)"; else
+    warn "Claude Code CLI ('claude') not found — needed for 'run'. Install: https://claude.com/claude-code"
+  fi
+  [ "$miss" = 0 ] || die "Install the missing dependencies above, then re-run: $0 quickstart"
+  echo
+
+  # 2. PATH symlinks
+  info "Step 2/6 — putting 'autofix' / 'autoBotDraft' on your PATH..."
+  ensure_symlinks
+  echo
+
+  # 3. Credentials / config
+  info "Step 3/6 — credentials..."
+  if [ -f "$CONFIG_FILE" ]; then
+    if ask_yes_no "A config already exists. Reconfigure it?" n; then cmd_setup; else ok "Keeping existing config."; fi
+  else
+    cmd_setup
+  fi
+  load_config
+  echo
+
+  # 4. Project -> repo mapping (loop until the user is done)
+  info "Step 4/6 — map Jira project keys to Bitbucket repo slugs (e.g. PROJ=my-repo)."
+  info "Current mapping: ${REPO_MAP:-(empty)}"
+  while ask_yes_no "Add a project mapping now?" "$([ -z "$REPO_MAP" ] && echo y || echo n)"; do
+    local pair
+    prompt_value pair "  Enter KEY=repo (blank to cancel)" ""
+    [ -z "$pair" ] && continue
+    case "$pair" in *=*) cmd_map "$pair"; load_config ;; *) warn "Format must be KEY=repo (e.g. PROJ=my-repo)." ;; esac
+  done
+  [ -z "$REPO_MAP" ] && warn "No repo mapping set — 'run' will skip tickets until you add one with: $0 map KEY=repo"
+  echo
+
+  # 5. Verify everything authenticates
+  info "Step 5/6 — verifying credentials..."
+  cmd_doctor || warn "Some checks failed above — fix them before relying on automatic runs."
+  echo
+
+  # 6. Auto-start at login + run now
+  info "Step 6/6 — running continuously."
+  local mins=5
+  if [ "$(uname -s)" = "Darwin" ]; then
+    if ask_yes_no "Auto-open a Terminal watching Jira at every login?" y; then
+      prompt_value mins "  Poll interval in minutes" "5"
+      cmd_install_login "$mins"
+    fi
+  else
+    info "(Auto-start at login is macOS-only. On Linux, add '$SELF start 5' to your Startup Applications, or use '$0 install-daemon 5'.)"
+  fi
+  echo
+  hr; ok "Setup complete. You're ready."
+  hr
+  if ask_yes_no "Start watching now (foreground; Ctrl-C to stop)?" y; then
+    start_watch "$mins"
+  else
+    info "Start anytime with:  autoBotDraft        (or '$0 start')"
+    info "Verify anytime with: $0 doctor"
+  fi
 }
 
 # =======================================================================
@@ -148,7 +318,11 @@ cmd_doctor() {
   [ -f "$CONFIG_FILE" ] && ok "config present" || { err "no config (run setup)"; return 1; }
   load_config
   echo "$(curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" "$JIRA_BASE_URL/rest/api/2/myself")" | jq -e '.accountId' >/dev/null 2>&1 \
-    && ok "Jira auth" || { err "Jira auth failed"; fail=1; }
+    && ok "Jira auth" || { err "Jira auth failed (token needs read:jira-user)"; fail=1; }
+  local bbcode; bbcode="$(curl -sS -o /dev/null -w '%{http_code}' -u "$JIRA_EMAIL:$BITBUCKET_API_TOKEN" "https://api.bitbucket.org/2.0/workspaces/$BITBUCKET_WORKSPACE" || true)"
+  [ "$bbcode" = "200" ] \
+    && ok "Bitbucket auth (workspace '$BITBUCKET_WORKSPACE' reachable)" \
+    || { err "Bitbucket auth failed (HTTP $bbcode) — 'autofix run' draft-PR step will fail. Token needs a Bitbucket-app token with read/write:pullrequest:bitbucket. Re-run setup."; fail=1; }
   info "git push auth is validated per-repo on first run (uses your local git credential helper)."
   [ "$fail" = 0 ] && ok "All good." || die "Some checks failed."
 }
@@ -162,12 +336,14 @@ cmd_map() { # map THER=thermometer_ios [PROJ=repo ...]
   local newmap="$REPO_MAP" pair k
   for pair in "$@"; do
     k="${pair%%=*}"
-    newmap="$(printf '%s' "$newmap" | tr ',' '\n' | grep -v "^$k=" | paste -sd, -)"
+    # Drop any prior entry for this key, then append. `|| true` so an empty map (no
+    # matching line → grep exits 1) doesn't abort the script under `set -e`/pipefail.
+    newmap="$(printf '%s' "$newmap" | tr ',' '\n' | grep -v "^$k=" | paste -sd, - || true)"
     newmap="${newmap:+$newmap,}$pair"
   done
   # rewrite REPO_MAP line in config
   local tmp; tmp="$(mktemp)"
-  grep -v '^REPO_MAP=' "$CONFIG_FILE" > "$tmp"
+  grep -v '^REPO_MAP=' "$CONFIG_FILE" > "$tmp" || true
   printf 'REPO_MAP="%s"\n' "$newmap" >> "$tmp"
   mv "$tmp" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
   ok "REPO_MAP = $newmap"
@@ -227,17 +403,34 @@ cmd_run() {
   fi
   info "Repo: $BITBUCKET_WORKSPACE/$repo"
 
-  # determine base branch (prefer configured, else repo mainbranch)
-  local remote="https://$BITBUCKET_GIT_USER@bitbucket.org/$BITBUCKET_WORKSPACE/$repo.git"
+  # Clean remote URL — no credentials embedded (git_bb supplies auth via header).
+  # Authenticated remote for git ops; clean URL only for display in messages.
+  local remote remote_clean
+  remote="$(bb_remote "$repo")"
+  remote_clean="https://bitbucket.org/$BITBUCKET_WORKSPACE/$repo.git"
 
-  # dedup: if a branch for this ticket already exists on the remote, it was handled — skip
-  if GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$remote" "feature/$key" 2>/dev/null | grep -q "feature/$key"; then
+  # dedup #1: an OPEN pull request already exists for this ticket's branch (incl.
+  # drafts) — don't clone/fix/re-open. PRs in any open state (drafts have state OPEN).
+  local prq prresp prn prurl
+  prq="$(jq -rn --arg b "feature/$key" '("state=\"OPEN\" AND source.branch.name=\"" + $b + "\"")|@uri')"
+  prresp="$(bb GET "/repositories/$BITBUCKET_WORKSPACE/$repo/pullrequests?q=$prq&fields=values.id,values.draft,values.links.html.href")"
+  if [ "$(http_code "$prresp")" = "200" ]; then
+    prn="$(http_body "$prresp" | jq -r '.values | length' 2>/dev/null || echo 0)"
+    if [ "${prn:-0}" -gt 0 ]; then
+      prurl="$(http_body "$prresp" | jq -r '.values[0].links.html.href // empty' 2>/dev/null)"
+      ok "$key already has an open pull request${prurl:+ — $prurl} — skipping (won't re-fix or re-draft)."
+      return 0
+    fi
+  fi
+
+  # dedup #2: if the ticket's branch already exists on the remote, it was handled — skip
+  if git_bb ls-remote --heads "$remote" "feature/$key" 2>/dev/null | grep -q "feature/$key"; then
     info "$key already has branch feature/$key on remote — skipping (already processed)."
     return 0
   fi
 
   local base="$BASE_BRANCH"
-  if ! GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$remote" "$base" 2>/dev/null | grep -q "$base"; then
+  if ! git_bb ls-remote --heads "$remote" "$base" 2>/dev/null | grep -q "$base"; then
     local mainb; mainb="$(http_body "$(bb GET "/repositories/$BITBUCKET_WORKSPACE/$repo")" | jq -r '.mainbranch.name // "main"')"
     warn "Base branch '$base' not found; using repo default '$mainb'."
     base="$mainb"
@@ -248,11 +441,11 @@ cmd_run() {
   local wt="$WORKSPACES_DIR/$repo"
   if [ -d "$wt/.git" ]; then
     info "Updating existing workspace clone..."
-    ( cd "$wt" && GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "$base" && git checkout -q -B "$base" "origin/$base" )
+    ( cd "$wt" && git remote set-url origin "$remote" && git_bb fetch --depth 1 origin "$base" && git checkout -q -B "$base" "origin/$base" )
   else
     info "Cloning $base ..."
-    GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$base" "$remote" "$wt" \
-      || die "Clone failed. Ensure your git credential helper has Bitbucket access (try a manual 'git clone $remote')."
+    git_bb clone --depth 1 --branch "$base" "$remote" "$wt" \
+      || die "Clone failed. Check 'autofix doctor' (Bitbucket auth) and that repo '$BITBUCKET_WORKSPACE/$repo' exists (manual test: git clone $remote_clean)."
   fi
 
   local branch="feature/$key"
@@ -297,8 +490,8 @@ EOF
 
   # ---- push ----
   info "Pushing $branch ..."
-  ( cd "$wt" && GIT_TERMINAL_PROMPT=0 git push -u origin "$branch" 2>&1 | tee "$runlog_dir/push.log" ) \
-    || die "Push failed (check git credentials). Branch committed locally at $wt."
+  ( cd "$wt" && git_bb push -u origin "$branch" 2>&1 | tee "$runlog_dir/push.log" ) \
+    || die "Push failed (check 'autofix doctor' Bitbucket auth). Branch committed locally at $wt."
 
   # ---- draft PR (REST; the only reliable way to set draft:true) ----
   info "Opening DRAFT pull request ..."
@@ -340,7 +533,7 @@ jira_comment() { # jira_comment KEY TEXT
 jira_progress() { # move ticket to first In-Progress transition
   local key="$1" trs tid
   trs="$(jira GET "/issue/$key/transitions")"
-  tid="$(echo "$trs" | jq -r '.transitions[] | select(.to.statusCategory.key=="indeterminate") | .id' | head -1)"
+  tid="$(echo "$trs" | jq -r '.transitions[] | select(.to.statusCategory.key=="indeterminate") | .id' | head -1 || true)"
   [ -n "$tid" ] || { warn "No In-Progress transition available"; return 1; }
   jira POST "/issue/$key/transitions" "$(jq -n --arg id "$tid" '{transition:{id:$id}}')" >/dev/null 2>&1 \
     && ok "Jira moved to In Progress" || warn "Jira transition failed"
@@ -352,7 +545,11 @@ jira_progress() { # move ticket to first In-Progress transition
 cmd_run_all() {
   load_config
   local watch=0
-  [ "${1:-}" = "--watch" ] && { watch="${2:-5}"; }
+  if [ "${1:-}" = "--watch" ]; then
+    watch="${2:-5}"
+    case "$watch" in ''|*[!0-9]*) die "--watch needs a whole number of minutes (e.g. --watch 5)." ;; esac
+    [ "$watch" -ge 1 ] || die "--watch interval must be at least 1 minute."
+  fi
 
   # prevent overlapping batches (e.g. a slow run still going when the next tick fires)
   if ! mkdir "$RUNALL_LOCK" 2>/dev/null; then
@@ -487,6 +684,50 @@ cmd_uninstall_daemon() {
   rmdir "$RUNALL_LOCK" 2>/dev/null || true
 }
 
+# =======================================================================
+# login launcher: auto-OPEN a visible Terminal at login and run the
+# FOREGROUND watcher inside it. Unlike the daemon, it is NOT supervised —
+# closing the Terminal window, Ctrl-C, or the watcher exiting all stop it.
+# =======================================================================
+cmd_install_login() {
+  load_config
+  local min="${1:-5}"
+  [ "$min" -ge 1 ] 2>/dev/null || die "Interval must be a whole number of minutes (>= 1)."
+  [ "$(uname -s)" = "Darwin" ] || die "install-login is macOS-only (uses Terminal + Login Items). On Linux, add '$SELF start $min' to your desktop's Startup Applications, or use '$0 install-daemon $min' for a headless background run."
+
+  # A double-clickable .command that runs the foreground watcher. `exec` so the
+  # watcher owns the Terminal session: closing the window or Ctrl-C ends it cleanly.
+  mkdir -p "$AUTOFIX_HOME"
+  cat > "$LOGIN_CMD" <<EOF
+#!/bin/bash
+# autofix-jira startup launcher — opens at login and watches Jira in the foreground.
+# Close this window (or press Ctrl-C) to stop. Re-open it from Login Items to restart.
+exec "$SELF" start $min
+EOF
+  chmod +x "$LOGIN_CMD"
+
+  # Register as a macOS Login Item (replace any existing one first to avoid dupes).
+  # Match by PATH so uninstall is reliable regardless of how macOS names the item.
+  osascript -e "tell application \"System Events\" to delete (every login item whose path is \"$LOGIN_CMD\")" >/dev/null 2>&1 || true
+  osascript -e "tell application \"System Events\" to make login item at end with properties {name:\"$LOGIN_ITEM_NAME\", path:\"$LOGIN_CMD\", hidden:false}" >/dev/null 2>&1 \
+    || die "Could not register the Login Item. macOS may have blocked Automation — allow Terminal to control 'System Events' in System Settings ▸ Privacy & Security ▸ Automation, then re-run '$0 install-login $min'."
+
+  hr; ok "Login launcher installed — a Terminal will open at every login and run 'autoBotDraft' ($min-min polls)."
+  info "Launcher script: $LOGIN_CMD"
+  info "It runs in the FOREGROUND: close the window or press Ctrl-C to stop it."
+  info "Remove it with:  $0 uninstall-login"
+  warn "First time only: macOS may ask permission for Terminal to control 'System Events' — click OK."
+  info "Start it now without rebooting:  open \"$LOGIN_CMD\""
+}
+
+cmd_uninstall_login() {
+  [ "$(uname -s)" = "Darwin" ] || { warn "install-login is macOS-only; nothing to remove."; return 0; }
+  osascript -e "tell application \"System Events\" to delete (every login item whose path is \"$LOGIN_CMD\")" >/dev/null 2>&1 \
+    && ok "Login Item removed." || warn "Could not remove the Login Item (it may already be gone)."
+  rm -f "$LOGIN_CMD" && ok "Launcher script removed."
+  info "Already-open watcher windows keep running until you close them or press Ctrl-C."
+}
+
 cmd_logs() {
   [ -f "$DAEMON_LOG" ] || { warn "No log yet at $DAEMON_LOG (daemon hasn't run)."; return 0; }
   case "${1:-}" in
@@ -524,7 +765,8 @@ usage() {
 autofix-jira v$VERSION — autonomous Jira → Claude Code → Bitbucket draft PRs
 
 Usage:
-  $0 setup                 Interactive one-time configuration
+  $0 quickstart            ★ Complete guided setup, end to end (deps → config → map → verify → auto-start → watch)
+  $0 setup                 Interactive one-time configuration (just the credentials step)
   $0 doctor                Verify deps + credentials
   $0 map KEY=repo [...]    Map a Jira project key to a Bitbucket repo slug
   $0 list                  List AI-eligible tickets assigned to you
@@ -534,6 +776,8 @@ Usage:
   autoBotDraft [MIN]       Shortcut command: start watching now, Ctrl-C to stop (like 'claude')
   $0 install-daemon [MIN]  Run in the BACKGROUND every MIN min (default 5) via launchd/cron; no terminal needed
   $0 uninstall-daemon      Stop and remove the background daemon + shell hook
+  $0 install-login [MIN]   macOS: auto-OPEN a Terminal at login running the foreground watcher (close window / Ctrl-C to stop)
+  $0 uninstall-login       Remove the login launcher (Login Item + script)
   $0 logs [-f|N]           Show daemon log (last N lines, or -f to follow live)
   $0 status [--brief]      Show daemon state + recent activity
   $0 version
@@ -546,6 +790,10 @@ EOF
 # Foreground watcher — run it, watch it work, Ctrl-C to stop (like `claude`).
 start_watch() {
   local mins="${1:-5}"
+  case "$mins" in
+    ''|*[!0-9]*) die "Interval must be a whole number of minutes. Usage: autoBotDraft [MINUTES] (e.g. 'autoBotDraft 5'). For other actions use 'autofix <command>', e.g. 'autofix doctor'." ;;
+  esac
+  [ "$mins" -ge 1 ] || die "Interval must be at least 1 minute."
   hr
   info "autoBotDraft — watching Jira every ${mins} min for AI tickets assigned to you."
   info "Each step is printed live below. Press Ctrl-C to stop."
@@ -561,6 +809,7 @@ main() {
   fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
+    quickstart|onboard|init) cmd_quickstart "$@" ;;
     setup)   cmd_setup "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     map)     cmd_map "$@" ;;
@@ -570,6 +819,8 @@ main() {
     start)   start_watch "${1:-5}" ;;
     install-daemon)   cmd_install_daemon "$@" ;;
     uninstall-daemon) cmd_uninstall_daemon "$@" ;;
+    install-login)    cmd_install_login "$@" ;;
+    uninstall-login)  cmd_uninstall_login "$@" ;;
     logs)             cmd_logs "$@" ;;
     status)           cmd_status "$@" ;;
     version|-v|--version) echo "autofix-jira v$VERSION" ;;
