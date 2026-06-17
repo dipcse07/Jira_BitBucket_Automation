@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(git fetch *)",
+      "Bash(git push *)",
+      "Read(//Users/mdsazidhasan.dip/.ssh/**)",
+      "Bash(ssh -i ~/.ssh/id_ed25519_github_ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -T git@github.com)",
+      "Bash(ssh -i ~/.ssh/unifa-sazid-GitHub -o IdentitiesOnly=yes -T git@github.com)",
+      "Bash(git remote *)",
+      "Bash(ssh -T git@github-dipcse07)",
+      "Bash(git commit *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git pull *)",
+      "Bash(gh auth *)",
+      "Bash(git ls-remote *)"
+    ]
+  }
+}
